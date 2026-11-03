@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .dataset import load_tasks
 from .util import load_env
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -124,6 +125,43 @@ def list_runs() -> list:
     return runs
 
 
+_TASKS = {}
+
+
+def dataset_tasks() -> dict:
+    """task_id -> Task, loaded once. Canary lines are removed, as in the runner."""
+    if not _TASKS:
+        cfg = config()["dataset"]
+        tasks, _ = load_tasks(ROOT / cfg["path"], cfg.get("canary_regex", ""))
+        _TASKS.update({t.id: t for t in tasks})
+    return _TASKS
+
+
+def run_rows(rid: str) -> list:
+    """Rows of scores_by_task.csv for one run."""
+    f = RESULTS / rid / "scores_by_task.csv"
+    if not f.is_file():
+        return []
+    with f.open() as fh:
+        return list(csv.DictReader(fh))
+
+
+def run_raw(rid: str, tid: str) -> tuple[dict, dict]:
+    """Replies (app -> record) and verdicts ((app, criterion_id) -> record) for one task of one run."""
+    replies, verdicts = {}, {}
+    raw = RESULTS / rid / "raw"
+    for name, target in (("replies.jsonl", replies), ("verdicts.jsonl", verdicts)):
+        if not (raw / name).is_file():
+            continue
+        with (raw / name).open() as fh:
+            for line in fh:
+                rec = json.loads(line)
+                key = rec["key"]
+                if len(key) >= 2 and key[1] == tid and (len(key) == (2 if name == "replies.jsonl" else 3)):
+                    target[key[0] if len(key) == 2 else (key[0], key[2])] = rec
+    return replies, verdicts
+
+
 def pct(x) -> str:
     return "–" if x is None or x != x else f"{100 * x:.1f}%"
 
@@ -208,6 +246,24 @@ blockquote{margin:8px 0;padding:10px 12px;border-left:3px solid var(--accent);ba
 .pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:var(--code);color:var(--muted);margin-left:6px}
 .state{font-weight:600}.state.failed,.state.stopped{color:var(--bad)}.state.done{color:var(--good)}
 .error{color:var(--bad);font-weight:600}
+.notice{font-size:13px;color:var(--muted);border:1px dashed var(--line);border-radius:10px;padding:8px 12px}
+.mini{display:grid;grid-template-columns:12px minmax(0,1fr) 4em 6.5em;gap:8px;align-items:center;font-size:13px;margin-top:4px}
+.mini .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bad{color:var(--bad)}.muted{color:var(--muted)}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;flex:none}
+.msg{margin:10px 0;padding:10px 12px;border-radius:12px;background:var(--code)}
+.msg.user{background:color-mix(in srgb,var(--accent) 14%,var(--card))}
+.msg .role{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.text{white-space:pre-wrap;overflow-wrap:anywhere}
+.reply{border-bottom:1px solid var(--line);padding:10px 0}.reply:last-child{border-bottom:0}
+.reply summary{cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.reply .text{margin-top:10px;padding:10px 12px;background:var(--code);border-radius:10px}
+.crit{padding:12px 0;border-bottom:1px solid var(--line)}.crit:last-child{border-bottom:0}
+.crit .meta{font-size:12px;color:var(--muted);margin-bottom:4px}.crit.neg .meta{color:var(--bad)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 8px;border-radius:99px;background:var(--code)}
+.chip.ok{background:color-mix(in srgb,var(--good) 18%,var(--card))}
+.chip.fail{background:color-mix(in srgb,var(--bad) 20%,var(--card));font-weight:600}
 .card h3{font-size:15px;margin:18px 0 2px}.card h3:first-of-type{margin-top:4px}
 .bars{margin:8px 0 4px}
 .bar{display:grid;grid-template-columns:minmax(0,9.5em) 1fr 3.6em;align-items:center;gap:8px;margin:7px 0;font-size:14px}
@@ -334,8 +390,103 @@ def report_page(rid: str) -> str | None:
                 'bars are scaled to the largest axis value. Below zero means penalties outweighed points.</p>'
                 f'{groups}</div>')
     files = " · ".join(f'<a href="/runs/{rid}/{f}">{f}</a>' for f in sorted(DOWNLOADS) if (RESULTS / rid / f).is_file())
-    return page(f"Run {rid}", f'<p><a href="/">← All runs</a></p>{top}<div class="card report">{markdown(path.read_text())}'
+    browse = (f'<a class="btn" href="/runs/{rid}/tasks">Browse tasks: prompts, replies, and rubric</a>'
+              if run_rows(rid) else "")
+    return page(f"Run {rid}", f'<p><a href="/">← All runs</a></p>{browse}{top}<div class="card report">{markdown(path.read_text())}'
                               f'<p class="hint">Download: {files}</p></div>')
+
+
+NOTICE = ('<p class="notice">This page shows MentalHealthBench test content. The dataset authors ask that it is not '
+          'posted online. Do not share screenshots or copy it outside the team.</p>')
+
+
+def task_list_page(rid: str, only: str) -> str | None:
+    rows = run_rows(rid)
+    if not RUN_ID.match(rid) or not rows:
+        return None
+    apps = list(dict.fromkeys(r["app"] for r in rows))
+    color = {a: i % 6 for i, a in enumerate(apps)}
+    by_task = {}
+    for r in rows:
+        by_task.setdefault(r["task_id"], {"meta": r, "apps": {}})["apps"][r["app"]] = r
+    items = sorted(by_task.items(), key=lambda kv: (-sum(int(x["penalties_fired"]) > 0 for x in kv[1]["apps"].values()),
+                                                     kv[1]["meta"]["acuity"], kv[0]))
+    if only in apps:
+        items = [kv for kv in items if int(kv[1]["apps"].get(only, {}).get("penalties_fired", 0)) > 0]
+    elif only == "harm":
+        items = [kv for kv in items if any(int(x["penalties_fired"]) > 0 for x in kv[1]["apps"].values())]
+    opts = [("", "All tasks"), ("harm", "A penalty fired for any app")] + [(a, f"A penalty fired for {a}") for a in apps]
+    select = "".join(f'<option value="{html.escape(v)}"{" selected" if v == only else ""}>{html.escape(t)}</option>'
+                     for v, t in opts)
+    cards = []
+    for tid, d in items:
+        m = d["meta"]
+        lines = "".join(
+            f'<div class="mini"><span class="dot c{color[a]}"></span><span class="name">{html.escape(a)}</span>'
+            f'<span>{pct(float(x["clipped"]))}</span>'
+            f'<span class="{"bad" if int(x["penalties_fired"]) else "muted"}">'
+            f'{x["penalties_fired"]} penalt{"y" if x["penalties_fired"] == "1" else "ies"}</span></div>'
+            for a, x in d["apps"].items())
+        cards.append(f'<a class="run" href="/runs/{rid}/tasks/{tid}"><div class="id">{html.escape(tid[:12])}…</div>'
+                     f'<div class="meta">{html.escape(m["acuity"])} · {html.escape(m["user_profile"])} · '
+                     f'{m["user_turns"]} user turn{"s" if m["user_turns"] != "1" else ""}</div>{lines}</a>')
+    body = (f'<p><a href="/runs/{rid}">← Report</a></p>{NOTICE}<div class="card"><h2>Tasks in run {rid}</h2>'
+            f'<form method="get"><select name="only" onchange="this.form.submit()">{select}</select></form>'
+            f'<p class="hint">{len(items)} tasks. Tasks with the most penalties come first. '
+            f'Score is the clipped score for that task.</p>{"".join(cards) or "<p>No tasks match.</p>"}</div>')
+    return page(f"Tasks · {rid}", body)
+
+
+def task_page(rid: str, tid: str) -> str | None:
+    rows = [r for r in run_rows(rid) if r["task_id"] == tid]
+    task = dataset_tasks().get(tid)
+    if not RUN_ID.match(rid) or not rows or task is None:
+        return None
+    replies, verdicts = run_raw(rid, tid)
+    apps = list(dict.fromkeys(r["app"] for r in run_rows(rid)))
+    color = {a: i % 6 for i, a in enumerate(apps)}
+    m = rows[0]
+    convo = "".join(f'<div class="msg {x["role"]}"><div class="role">{x["role"]}</div>'
+                    f'<div class="text">{html.escape(x["content"])}</div></div>' for x in task.messages)
+    score = {r["app"]: r for r in rows}
+    reply_blocks = []
+    for a in apps:
+        if a not in score:
+            continue
+        r = replies.get(a, {})
+        text = r.get("text") or r.get("error") or "(The raw reply is not in this run folder.)"
+        sc = score[a]
+        reply_blocks.append(
+            f'<details class="reply"><summary><span class="dot c{color[a]}"></span><b>{html.escape(a)}</b> · '
+            f'score {pct(float(sc["clipped"]))} · {sc["penalties_fired"]} penalties</summary>'
+            f'<div class="text">{html.escape(text)}</div></details>')
+    crit = []
+    for c in sorted(task.criteria, key=lambda c: (c.points > 0, -abs(c.points))):
+        chips = []
+        for a in apps:
+            v = verdicts.get((a, c.id))
+            if a not in score:
+                continue
+            if v is None or "met" not in v:
+                chips.append(f'<span class="chip">{html.escape(a)}: ?</span>')
+                continue
+            good = v["met"] == (c.points > 0)
+            mark = "met" if v["met"] else "not met"
+            prob = f' ({v["probability"]:.2f})' if isinstance(v.get("probability"), (int, float)) else ""
+            chips.append(f'<span class="chip {"ok" if good else "fail"}"><span class="dot c{color[a]}"></span>'
+                         f'{html.escape(a)}: {mark}{prob}</span>')
+        kind = "Penalty" if c.points < 0 else "Points"
+        crit.append(f'<div class="crit {"neg" if c.points < 0 else "pos"}"><div class="meta">{kind} {c.points:+g} · '
+                    f'{html.escape(c.axis.replace("_", " "))} · {html.escape(c.id)}</div>'
+                    f'<div>{html.escape(c.text)}</div><div class="chips">{"".join(chips)}</div></div>')
+    body = (f'<p><a href="/runs/{rid}/tasks">← All tasks</a></p>{NOTICE}'
+            f'<div class="card"><h2>Task {html.escape(tid[:12])}…</h2><p class="hint">{html.escape(m["acuity"])} · '
+            f'{html.escape(m["user_profile"])} · {html.escape(m["language"])} · full id {html.escape(tid)}</p>{convo}</div>'
+            f'<div class="card"><h2>Replies</h2><p class="hint">Tap an app to read its reply.</p>{"".join(reply_blocks)}</div>'
+            f'<div class="card"><h2>Rubric</h2><p class="hint">Penalties come first. Green means the app did the right '
+            f'thing: it met a points criterion, or it avoided a penalty. Red means it missed points or a penalty fired. '
+            f'The number is the judge\'s probability.</p>{"".join(crit)}</div>')
+    return page(f"Task {tid[:12]}", body)
 
 
 # --- HTTP ---
@@ -360,6 +511,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.send_header("Referrer-Policy", "no-referrer")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -389,6 +541,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[0] == "runs":
             body = report_page(parts[1])
             return self.send(200, body) if body else self.send(404, page("Not found", "<p>No such run.</p>"))
+        if len(parts) == 3 and parts[0] == "runs" and parts[2] == "tasks":
+            only = (parse_qs(urlparse(self.path).query).get("only") or [""])[0]
+            body = task_list_page(parts[1], only)
+            return self.send(200, body) if body else self.send(404, page("Not found", "<p>No task data for this run.</p>"))
+        if len(parts) == 4 and parts[0] == "runs" and parts[2] == "tasks":
+            body = task_page(parts[1], parts[3])
+            return self.send(200, body) if body else self.send(404, page("Not found", "<p>No such task in this run.</p>"))
         if len(parts) == 3 and parts[0] == "runs" and RUN_ID.match(parts[1]) and parts[2] in DOWNLOADS:
             f = RESULTS / parts[1] / parts[2]
             if f.is_file():
