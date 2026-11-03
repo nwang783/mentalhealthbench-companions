@@ -95,6 +95,72 @@ provider = "openrouter"
 model = "anthropic/claude-sonnet-5.5"
 workers = 4
 
+# --- Fine-tuning and persona study. default = false: these run only when --apps names them. ---
+# Each roleplay model is compared with the model it was tuned from, with and without the persona.
+
+[[apps]]
+name = "euryale_plain"
+label = "Euryale, no persona"
+provider = "openrouter"
+model = "sao10k/l3.1-euryale-70b"
+workers = 4
+default = false
+
+[[apps]]
+name = "llama31_persona"        # Euryale 3.1 was fine-tuned from this model
+label = "Llama 3.1 70B"
+about = "The model that Euryale was fine-tuned from."
+provider = "openrouter"
+model = "meta-llama/llama-3.1-70b-instruct"
+persona_file = "prompts/personas/companion_friend.txt"
+workers = 4
+default = false
+
+[[apps]]
+name = "llama31_plain"
+label = "Llama 3.1 70B, no persona"
+provider = "openrouter"
+model = "meta-llama/llama-3.1-70b-instruct"
+workers = 4
+default = false
+
+[[apps]]
+name = "minimax_her_plain"
+label = "MiniMax Her, no persona"
+provider = "openrouter"
+model = "minimax/minimax-m2-her"
+workers = 4
+default = false
+
+[[apps]]
+name = "minimax_m2_persona"     # Nearest general model in the M2 family; MiniMax does not name M2-her's parent
+label = "MiniMax M2"
+about = "A general MiniMax model from the same family as MiniMax Her."
+provider = "openrouter"
+model = "minimax/minimax-m2"
+persona_file = "prompts/personas/companion_friend.txt"
+max_tokens = 4096               # M2 thinks before it replies; the thinking uses tokens too
+workers = 4
+default = false
+
+[[apps]]
+name = "minimax_m2_plain"
+label = "MiniMax M2, no persona"
+provider = "openrouter"
+model = "minimax/minimax-m2"
+max_tokens = 4096
+workers = 4
+default = false
+
+[[apps]]
+name = "claude_persona"
+label = "Claude + persona"
+provider = "openrouter"
+model = "anthropic/claude-sonnet-5.5"
+persona_file = "prompts/personas/companion_friend.txt"
+workers = 4
+default = false
+
 # [[apps]]
 # name = "kindroid"
 # provider = "kindroid"

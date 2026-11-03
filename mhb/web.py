@@ -101,10 +101,14 @@ def list_runs() -> list:
 
 
 def featured_run(runs: list):
-    """The newest real run with the most conversations: the one to show first."""
+    """The run to show first: the newest real run named "Main study", else the newest
+    real run with the most conversations."""
     real = [r for r in runs if not r[1].get("meta", {}).get("mock")]
     if not real:
         return None
+    named = [r for r in real if r[1]["meta"].get("name") == "Main study"]
+    if named:
+        return named[0]
     most = max(r[1]["meta"].get("n_tasks", 0) for r in real)
     return next(r for r in real if r[1]["meta"].get("n_tasks", 0) == most)
 
@@ -460,9 +464,10 @@ def home_page() -> str:
     else:
         hero = '<div class="card"><h2>No results yet</h2><p class="sub">Results show here after a test has run.</p></div>'
     items = "".join(
-        f'<a class="item" href="/runs/{rid}" data-run="{rid}"><div><div class="title">{when(rid)}'
+        f'<a class="item" href="/runs/{rid}" data-run="{rid}"><div><div class="title">'
+        f'{esc(d["meta"].get("name") or when(rid))}'
         f'{" <span class=tag>practice</span>" if d["meta"].get("mock") else ""}</div>'
-        f'<div class="meta">{d["meta"].get("n_tasks", "?")} conversations · '
+        f'<div class="meta">{when(rid) + " · " if d["meta"].get("name") else ""}{d["meta"].get("n_tasks", "?")} conversations · '
         f'{", ".join(esc(label_of(a, labels)) for a in d.get("summary", {}))}</div></div><span class="arrow">›</span></a>'
         for rid, d in runs) or '<p class="empty">No tests yet.</p>'
     return page("Results", f"""<h1>Overview</h1>
@@ -527,7 +532,7 @@ def report_page(rid: str) -> str | None:
     files = " · ".join(f'<a href="/runs/{rid}/{f}">{f}</a>' for f in sorted(DOWNLOADS) if (RESULTS / rid / f).is_file())
     browse = f'<a class="btn" href="/runs/{rid}/tasks">Read the conversations</a>' if rows else ""
     body = f"""<a class="back" href="/">‹ All results</a>
-<h1>Results</h1><p class="lead">{meta.get("n_tasks", "?")} conversations · {when(rid)} ·
+<h1>{esc(meta.get("name") or "Results")}</h1><p class="lead">{meta.get("n_tasks", "?")} conversations · {when(rid)} ·
 {"fast grading" if meta.get("judge", {}).get("mode") == "decisions" else "paper's grader"}</p>
 {mock}<div class="card"><h2>How to read this</h2><p class="sub">Three words explain most of this page.</p>{EXPLAIN}
 <div class="btn-row">{browse}</div></div>

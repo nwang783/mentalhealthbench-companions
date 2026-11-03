@@ -27,6 +27,7 @@ def parse_args(argv):
     p.add_argument("--yes", "-y", action="store_true", help="skip the cost confirmation")
     p.add_argument("--limit", type=int, default=0, help="use only the first N sampled tasks (quick trial)")
     p.add_argument("--apps", default="", help="comma-separated app names from config.toml (default: all)")
+    p.add_argument("--name", default="", help="a short name for this run, shown on the web page")
     p.add_argument("--max-tasks", type=int, help="override [sample].max_tasks (0 = every task that matches a group)")
     p.add_argument("--judge-mode", choices=["decisions", "responses"], help="override [judge].mode")
     p.add_argument("--config", default="config.toml")
@@ -114,7 +115,9 @@ def main(argv=None):
 
     # --- Build apps and judge, check keys ---
     wanted = {n.strip() for n in args.apps.split(",") if n.strip()}
-    app_cfgs = [a for a in cfg["apps"] if not wanted or a["name"] in wanted]
+    # Apps with default = false run only when --apps names them.
+    app_cfgs = [a for a in cfg["apps"] if a["name"] in wanted] if wanted else \
+               [a for a in cfg["apps"] if a.get("default", True)]
     adapters = [make_adapter(a, cfg.get("generation", {}), ROOT, mock) for a in app_cfgs]
     judge = Judge(cfg["judge"], ROOT, mock)
     if not mock:
@@ -255,7 +258,7 @@ def main(argv=None):
         if isinstance(v, dict):
             usage["input"] += v["usage"]["input"]
             usage["output"] += v["usage"]["output"]
-    meta = {"run_id": run_id, "mock": mock, "judge": judge.fingerprint(), "n_tasks": len(selected),
+    meta = {"run_id": run_id, "name": args.name, "mock": mock, "judge": judge.fingerprint(), "n_tasks": len(selected),
             "apps": {a.name: a.fingerprint() for a in adapters},
             "approximate_apps": [a.name for a in adapters if not a.supports_prefix],
             "errors": dict(errors), "skipped_tasks": skipped, "tokens_reported_by_apis": dict(usage),
