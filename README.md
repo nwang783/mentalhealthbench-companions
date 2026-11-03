@@ -87,6 +87,7 @@ Keep these apart. Companion replies are short. Short replies lose positive point
 
 ```
 run.sh, run.command   start here
+Dockerfile, fly.toml  web demo deploy
 config.toml           apps, sample, judge, pushback
 prompts/              grader prompt, companion persona
 data/mentalhealthbench/   put the dataset here
@@ -98,7 +99,46 @@ mhb/                  the code
   score.py     scoring, bootstrap CIs, pushback metrics
   report.py    CSV, JSON, Markdown
   cli.py       the run loop
+  web.py       the password-protected web demo
 ```
+
+## Web demo
+
+A small web page lets teammates start runs and read reports on a phone. It has one shared password.
+
+Run it on your computer:
+
+```bash
+python3 -m mhb.web
+```
+
+Then open http://localhost:8080. It reads `DEMO_PASSWORD` and the API keys from `.env`.
+
+The page:
+
+- starts a run (number of tasks, apps, judge mode, or a free mock run), shows its progress, and can stop it;
+- lists the runs and shows each report, with a short summary for each app;
+- lets you download `report.md`, `summary.json`, and the CSV files.
+
+It never serves `raw/` or `.env`. Only one run can go at a time. `MAX_TASKS` (default 150) is the largest run a teammate can start. Each run costs API money, so give the password only to people you trust.
+
+### Deploy to Fly.io
+
+The dataset is not in git, so deploy from a folder that has the dataset in `data/mentalhealthbench/`.
+
+1. In `fly.toml`, set `app` to a unique name.
+2. Make the app and the results volume:
+   ```bash
+   fly apps create <name>
+   fly volumes create mhb_results --app <name> --region iad --size 1
+   ```
+3. Send the keys and the password from `.env` as secrets:
+   ```bash
+   grep -E '^(OPENROUTER_API_KEY|OPENAI_API_KEY|DEMO_PASSWORD)=' .env | fly secrets import --app <name>
+   ```
+4. Deploy: `fly deploy`. The page is at `https://<name>.fly.dev`.
+
+To change the password, run `fly secrets set DEMO_PASSWORD=<new password> --app <name>`. This also logs out everyone.
 
 ## Status and open decisions
 

@@ -27,6 +27,7 @@ def parse_args(argv):
     p.add_argument("--yes", "-y", action="store_true", help="skip the cost confirmation")
     p.add_argument("--limit", type=int, default=0, help="use only the first N sampled tasks (quick trial)")
     p.add_argument("--apps", default="", help="comma-separated app names from config.toml (default: all)")
+    p.add_argument("--judge-mode", choices=["decisions", "responses"], help="override [judge].mode")
     p.add_argument("--config", default="config.toml")
     return p.parse_args(argv)
 
@@ -85,6 +86,8 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     load_env(ROOT / ".env")
     cfg = tomllib.loads((ROOT / args.config).read_text())
+    if args.judge_mode:
+        cfg["judge"]["mode"] = args.judge_mode
     mock = args.mock
 
     # --- Load and sample tasks ---
