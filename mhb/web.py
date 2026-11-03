@@ -629,8 +629,14 @@ def findings_page() -> str | None:
         ("Score", a["score"], "good"), ("Breaks the law check", a["violation"], "warn")]) for a in cl["apps"])
     facts = "".join(f"<li><b>{esc(k)}</b> {esc(v)}</li>" for k, v in F["reliability"])
 
+    cases = ""
+    if (RESULTS / "standouts.json").is_file():
+        cases = ('<a class="card" href="/findings/cases" style="display:block;text-decoration:none"><span class="finding">Examples</span>'
+                 '<h2>Standout cases ›</h2><p class="sub" style="margin-bottom:0">Real replies where an app went badly wrong, '
+                 'with what the person said and why it matters.</p></a>')
     body = f"""<h1>Findings</h1>
 <p class="lead">What we learned from the tests so far, one idea per card. Updated {esc(F.get("updated", ""))}.</p>
+{cases}
 
 <div class="card"><span class="finding">Finding 1</span><h2>The law check reverses the safety ranking</h2>
 <p class="takeaway">The clinicians' checklist calls Claude the most harmful. A check based on companion-chatbot laws calls it the safest.</p>
@@ -666,6 +672,42 @@ no crisis line {change(pooled["no_referral"])}. Claude Haiku did not change (sco
 <div class="card"><span class="finding">How much to trust this</span><h2>Reliability</h2>
 <ul class="facts">{facts}</ul></div>"""
     return page("Findings", body, active="findings")
+
+
+COND_ABOUT = {"Usual test": "The earlier replies come from the dataset.",
+              "Own history": "The app wrote every earlier reply itself.",
+              "Casual-style history": "The dataset's earlier replies, rewritten in a casual texting style."}
+
+
+def cases_page() -> str | None:
+    path = RESULTS / "standouts.json"
+    if not path.is_file():
+        return None
+    labels = app_labels() | {"claude_reference": "Claude Sonnet"}
+    cards = []
+    for c in json.loads(path.read_text())["cases"]:
+        name = label_of(c["app"], labels)
+        if c.get("convo"):
+            bubbles = "".join(f'<div class="msg {m["role"]}"><span class="who">{"Person" if m["role"] == "user" else esc(name)}</span>'
+                              f'{esc(m["content"])}</div>' for m in c["convo"])
+            more = (f'<details class="tech"><summary>See the whole conversation</summary><div class="chat" style="margin-top:12px">'
+                    f'{bubbles}</div></details>')
+        else:
+            more = f'<p class="small" style="margin:12px 0 0"><a href="{esc(c["link"])}">See the whole conversation and checklist ›</a></p>'
+        cards.append(f"""<div class="card"><div class="verdicts" style="margin:0 0 10px"><span class="tag bad">{esc(c["group"])}</span>
+<span class="tag">{esc(name)}</span><span class="tag" title="{esc(COND_ABOUT.get(c["cond"], ""))}">{esc(c["cond"])}</span></div>
+<h2>{esc(c["title"])}</h2>
+<p class="sub"><b>What happened before:</b> {esc(c["situation"])}</p>
+<div class="chat"><div class="msg assistant"><span class="who">{esc(name)} replied</span>{esc(c["reply"])}</div></div>
+<p style="margin:12px 0 0;font-size:14px"><b>Why it matters:</b> {esc(c["why"])}</p>{more}</div>""")
+    conds = "".join(f"<div><b>{esc(k)}</b><span>{esc(v)}</span></div>" for k, v in COND_ABOUT.items())
+    body = f"""<a class="back" href="/findings">‹ Findings</a><h1>Standout cases</h1>
+<p class="lead">Real replies from our tests where an app went badly wrong. We chose them by hand from replies that the AI judge flagged,
+and we read each full conversation to check it. They show what can happen. They do not show how often it happens.</p>
+{NOTICE}<div class="card"><h2>Three kinds of test</h2><p class="sub">Each case says which test it comes from.</p>
+<div class="explain">{conds}</div></div>
+{"".join(cards)}"""
+    return page("Standout cases", body, active="findings")
 
 
 NOTICE = ('<p class="notice">These conversations come from the MentalHealthBench test set. The authors ask that they are not '
@@ -841,6 +883,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/findings":
             body = findings_page()
             return self.send(200, body) if body else self.not_found("There are no findings yet.")
+        if path == "/findings/cases":
+            body = cases_page()
+            return self.send(200, body) if body else self.not_found("There are no standout cases yet.")
         parts = path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "runs":
             body = report_page(parts[1])
