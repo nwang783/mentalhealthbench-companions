@@ -1,7 +1,8 @@
-"""Small password-protected web front end: start runs, watch progress, read reports.
+"""Small password-protected web page for exploring results. It is read-only: runs are
+started with ./run.sh, not from the page.
 
 Start it with:  DEMO_PASSWORD=... python3 -m mhb.web
-One run at a time. Raw replies and verdicts are never served, because they hold dataset text.
+Raw replies are shown only on the conversation pages, behind the password.
 """
 import csv
 import hashlib
@@ -10,21 +11,19 @@ import html
 import json
 import os
 import re
-import subprocess
 import sys
-import threading
 import time
 import tomllib
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .dataset import load_tasks
 from .util import load_env
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "results"
-LOGS = RESULTS / "web_logs"
 COOKIE = "mhb_session"
 SESSION_DAYS = 14
 DOWNLOADS = {"report.md", "summary.json", "scores_by_task.csv", "scores_by_axis.csv"}
@@ -33,7 +32,33 @@ RUN_ID = re.compile(r"^(mock-)?\d{8}-\d{6}$")
 load_env(ROOT / ".env")
 PASSWORD = os.environ.get("DEMO_PASSWORD", "")
 SECRET = hashlib.sha256(("mhb-web:" + os.environ.get("SESSION_SECRET", PASSWORD)).encode()).digest()
-MAX_TASKS = int(os.environ.get("MAX_TASKS", "150"))
+
+# Plain-language names for the dataset labels.
+ACUITY = {"non_acute": ("Everyday", "Everyday stress or sadness, no danger."),
+          "high_acuity": ("High risk", "Serious distress that needs care soon."),
+          "emergent": ("Emergency", "Possible danger to life right now.")}
+AXES = [  # (name prefix, short name, one-line explanation)
+    ("dual_use_refusals", "Avoiding harm", "Does not give information that could be used for self-harm."),
+    ("over_alarmism", "Right level of concern", "Does not overreact or underreact to risk."),
+    ("unsupported_belief", "Reality checks", "Does not agree with false or harmful beliefs."),
+    ("clinical_reasoning", "Health accuracy", "Gets the medical and mental-health facts right."),
+    ("context_seeking", "Asking the right questions", "Asks about safety and details before it gives advice."),
+    ("empathy", "Empathy", "Responds with care to how the person feels."),
+    ("actionable_guidance", "Practical help", "Gives clear coping steps that the person can use."),
+    ("interpretation", "Helping reframe thoughts", "Helps the person see the situation in a healthier way."),
+    ("communication", "Clear writing", "Easy to read, with the right length and tone."),
+]
+
+
+def axis_info(name: str) -> tuple[str, str]:
+    for prefix, short, about in AXES:
+        if name.startswith(prefix):
+            return short, about
+    return name.replace("_", " ").capitalize(), ""
+
+
+def axis_order(name: str) -> int:
+    return next((i for i, (p, _, _) in enumerate(AXES) if name.startswith(p)), len(AXES))
 
 
 # --- Sessions: a signed cookie that holds only an expiry time ---
@@ -49,68 +74,18 @@ def valid_token(token: str) -> bool:
     return exp.isdigit() and int(exp) > time.time() and hmac.compare_digest(sig, good)
 
 
-# --- The one background run ---
-
-class Job:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.proc = None
-        self.log = None
-        self.args = []
-        self.started = 0.0
-
-    def running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
-
-    def start(self, args: list) -> str | None:
-        with self.lock:
-            if self.running():
-                return "A run is in progress. Wait for it to finish, or stop it."
-            LOGS.mkdir(parents=True, exist_ok=True)
-            self.log = LOGS / time.strftime("%Y%m%d-%H%M%S.log")
-            self.args, self.started = args, time.time()
-            out = self.log.open("w")
-            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-            self.proc = subprocess.Popen([sys.executable, "-m", "mhb", "--yes", *args], cwd=ROOT, env=env,
-                                         stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-            out.close()
-            return None
-
-    def stop(self) -> None:
-        with self.lock:
-            if self.running():
-                self.proc.terminate()
-
-    def status(self) -> dict:
-        if not self.log:
-            return {"state": "idle"}
-        text = self.log.read_text(errors="replace") if self.log.exists() else ""
-        lines = []
-        for line in text.replace("\r", "\n").splitlines():
-            # Keep only the newest progress line of each step ("  replies: 3/40 ...").
-            m = re.match(r"\s+([\w ]+): \d+/\d+", line)
-            if m and lines and lines[-1].startswith(m.group(0).split(":")[0] + ":"):
-                lines[-1] = line
-            elif line.strip():
-                lines.append(line)
-        done = re.search(r"Report: results/([^/\s]+)/report\.md", text)
-        if self.running():
-            state = "running"
-        elif done:
-            state = "done"
-        else:
-            state = "stopped" if self.proc.returncode in (-15, 143) else "failed"
-        return {"state": state, "args": " ".join(self.args), "elapsed": int(time.time() - self.started),
-                "tail": "\n".join(lines[-16:]), "run_id": done.group(1) if done else None}
-
-
-JOB = Job()
-
-
 # --- Data for the pages ---
 
 def config() -> dict:
     return tomllib.loads((ROOT / "config.toml").read_text())
+
+
+def app_labels() -> dict:
+    return {a["name"]: a.get("label", a["name"]) for a in config()["apps"]}
+
+
+def label_of(app: str, labels: dict) -> str:
+    return labels.get(app, app.replace("_", " "))
 
 
 def list_runs() -> list:
@@ -123,6 +98,24 @@ def list_runs() -> list:
         if RUN_ID.match(d.parent.name):
             runs.append((d.parent.name, data))
     return runs
+
+
+def featured_run(runs: list):
+    """The newest real run with the most conversations: the one to show first."""
+    real = [r for r in runs if not r[1].get("meta", {}).get("mock")]
+    if not real:
+        return None
+    most = max(r[1]["meta"].get("n_tasks", 0) for r in real)
+    return next(r for r in real if r[1]["meta"].get("n_tasks", 0) == most)
+
+
+def when(rid: str) -> str:
+    stamp = rid.removeprefix("mock-")
+    try:
+        d = datetime.strptime(stamp, "%Y%m%d-%H%M%S")
+    except ValueError:
+        return rid
+    return d.strftime("%b %-d, %Y · %-I:%M %p")
 
 
 _TASKS = {}
@@ -138,7 +131,6 @@ def dataset_tasks() -> dict:
 
 
 def run_rows(rid: str) -> list:
-    """Rows of scores_by_task.csv for one run."""
     f = RESULTS / rid / "scores_by_task.csv"
     if not f.is_file():
         return []
@@ -146,27 +138,41 @@ def run_rows(rid: str) -> list:
         return list(csv.DictReader(fh))
 
 
+def run_axes(rid: str) -> dict:
+    f = RESULTS / rid / "scores_by_axis.csv"
+    axes = {}
+    if f.is_file():
+        with f.open() as fh:
+            for row in csv.DictReader(fh):
+                axes.setdefault(row["axis"], {})[row["app"]] = float(row["signed"])
+    return axes
+
+
 def run_raw(rid: str, tid: str) -> tuple[dict, dict]:
     """Replies (app -> record) and verdicts ((app, criterion_id) -> record) for one task of one run."""
     replies, verdicts = {}, {}
     raw = RESULTS / rid / "raw"
-    for name, target in (("replies.jsonl", replies), ("verdicts.jsonl", verdicts)):
+    for name, target, size in (("replies.jsonl", replies, 2), ("verdicts.jsonl", verdicts, 3)):
         if not (raw / name).is_file():
             continue
         with (raw / name).open() as fh:
             for line in fh:
                 rec = json.loads(line)
                 key = rec["key"]
-                if len(key) >= 2 and key[1] == tid and (len(key) == (2 if name == "replies.jsonl" else 3)):
-                    target[key[0] if len(key) == 2 else (key[0], key[2])] = rec
+                if len(key) == size and key[1] == tid:
+                    target[key[0] if size == 2 else (key[0], key[2])] = rec
     return replies, verdicts
 
 
-def pct(x) -> str:
-    return "–" if x is None or x != x else f"{100 * x:.1f}%"
+def pct(x, digits: int = 0) -> str:
+    return "–" if x is None or x != x else f"{100 * x:.{digits}f}%"
 
 
-# --- A small Markdown renderer for the reports: headings, quotes, tables, code, bold, inline code ---
+def esc(x) -> str:
+    return html.escape(str(x))
+
+
+# --- A small Markdown renderer for the technical report ---
 
 def inline(text: str) -> str:
     text = html.escape(text, quote=False)
@@ -197,7 +203,7 @@ def markdown(md: str) -> str:
             out.append(f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>')
             continue
         if m := re.match(r"^(#{1,3}) (.*)", line):
-            n = len(m.group(1)) + 1
+            n = len(m.group(1)) + 2
             out.append(f"<h{n}>{inline(m.group(2))}</h{n}>")
         elif line.startswith("> "):
             out.append(f"<blockquote>{inline(line[2:])}</blockquote>")
@@ -207,154 +213,264 @@ def markdown(md: str) -> str:
     return "\n".join(out)
 
 
-# --- Pages ---
+# --- Look and feel ---
 
 STYLE = """
-:root{--bg:#f7f7f5;--card:#fff;--text:#1d1d1f;--muted:#6b6b70;--line:#e3e3e0;--accent:#3e63dd;--accent-text:#fff;
---bad:#c23b3b;--good:#2f7d4f;--code:#f0f0ec}
-@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1e1e21;--text:#ececee;--muted:#9a9aa2;--line:#2e2e33;
---accent:#7b97f0;--accent-text:#0d0d10;--bad:#f07a7a;--good:#6fcf97;--code:#26262a}}
+:root{--bg:#eceef1;--shell:#f7f7f8;--card:#ffffff;--text:#101114;--muted:#6e717a;--faint:#a3a6ad;--line:#e6e7eb;
+--accent:#2f5bea;--accent-2:#9db3f7;--accent-soft:#eaf0ff;--good:#1f8a52;--good-soft:#e6f5ec;--bad:#d1453b;--bad-soft:#fdecea;
+--warn:#b7791f;--chip:#f1f2f4;--shadow:0 1px 2px rgba(16,17,20,.04),0 8px 24px rgba(16,17,20,.05);
+--a0:#2f5bea;--a1:#f08c00;--a2:#12a36e;--a3:#8a4fe6;--a4:#0f9fb5;--a5:#d6336c}
+@media (prefers-color-scheme:dark){:root{--bg:#0c0d10;--shell:#141519;--card:#1b1c21;--text:#f1f2f4;--muted:#9a9da6;
+--faint:#6b6e77;--line:#2a2c33;--accent:#7f9cff;--accent-2:#3b4f9a;--accent-soft:#1f2740;--good:#57c98a;--good-soft:#16291f;
+--bad:#ff7b72;--bad-soft:#331a19;--warn:#e3b341;--chip:#24262c;--shadow:none;
+--a0:#7f9cff;--a1:#ffa94d;--a2:#4cd69b;--a3:#b490ff;--a4:#4fd1e3;--a5:#f783ac}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:860px;margin:0 auto;padding:16px 16px 48px}
-header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:4px 0 16px}
-header h1{font-size:20px;margin:0}
-a{color:var(--accent)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:0 0 16px}
-.card h2{font-size:17px;margin:0 0 12px}
-label{display:block;font-weight:600;font-size:14px;margin:12px 0 6px}
-.hint{color:var(--muted);font-size:13px;font-weight:400;overflow-wrap:anywhere}
-input[type=number],input[type=password],select{width:100%;font-size:16px;padding:12px;border-radius:10px;
-border:1px solid var(--line);background:var(--bg);color:var(--text)}
-.checks label{display:flex;align-items:center;gap:12px;font-weight:400;margin:0;padding:10px 0;border-bottom:1px solid var(--line)}
-.checks label:last-child{border-bottom:0}
-input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
-button,.btn{display:block;width:100%;text-align:center;font-size:16px;font-weight:600;padding:14px;margin-top:16px;
-border:0;border-radius:12px;background:var(--accent);color:var(--accent-text);text-decoration:none;cursor:pointer}
-button.secondary{background:transparent;color:var(--bad);border:1px solid var(--line)}
-.linkbtn{background:none;border:0;color:var(--accent);padding:0;margin:0;width:auto;font-weight:400;font-size:15px}
-pre{background:var(--code);padding:12px;border-radius:10px;overflow-x:auto;font-size:13px;white-space:pre-wrap;word-break:break-word}
-code{background:var(--code);padding:1px 5px;border-radius:5px;font-size:.9em;word-break:break-all}
-.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px 0 16px}
-table{border-collapse:collapse;font-size:14px;min-width:100%}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+-webkit-font-smoothing:antialiased}
+a{color:inherit}
+.shell{max-width:1040px;margin:0 auto;padding:16px}
+@media (min-width:760px){.shell{padding:28px 24px}}
+.frame{background:var(--shell);border-radius:28px;padding:18px 16px 32px;box-shadow:var(--shadow)}
+@media (min-width:760px){.frame{padding:28px 36px 44px}}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:650;font-size:17px;letter-spacing:-.01em}
+.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--accent),#7aa2ff);display:grid;place-items:center;
+color:#fff;font-size:15px;font-weight:700;box-shadow:0 2px 6px rgba(47,91,234,.35)}
+.nav{display:flex;gap:4px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px}
+.nav a,.nav button{font:inherit;font-size:14px;text-decoration:none;padding:7px 14px;border-radius:999px;color:var(--muted);
+background:none;border:0;cursor:pointer}
+.nav a.on{background:var(--text);color:var(--card);font-weight:550}
+.nav a:hover:not(.on),.nav button:hover{color:var(--text)}
+h1{font-size:34px;line-height:1.1;letter-spacing:-.03em;font-weight:650;margin:6px 0 8px}
+@media (min-width:760px){h1{font-size:44px}}
+.lead{color:var(--muted);max-width:620px;margin:0 0 24px;font-size:15.5px}
+.back{display:inline-flex;gap:6px;color:var(--muted);text-decoration:none;font-size:14px;margin-bottom:6px}
+.back:hover{color:var(--text)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:20px;margin:0 0 16px}
+@media (min-width:760px){.card{padding:26px 28px}}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:4px}
+h2{font-size:20px;letter-spacing:-.015em;font-weight:620;margin:0}
+h3{font-size:15px;font-weight:600;margin:20px 0 2px}
+.sub{color:var(--muted);font-size:13.5px;margin:4px 0 16px}
+.muted{color:var(--muted)}.small{font-size:13px}
+.grid{display:grid;gap:16px}
+@media (min-width:860px){.grid.two{grid-template-columns:1.35fr 1fr}}
+/* big numbers */
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--line);margin-top:8px}
+@media (min-width:760px){.stats{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.stat{padding:14px 14px 4px 0;border-bottom:1px solid var(--line)}
+@media (min-width:760px){.stat{border-bottom:0;border-left:1px solid var(--line);padding:16px 16px 0}.stat:first-child{border-left:0;padding-left:0}}
+.stat .k{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat .v{font-size:32px;letter-spacing:-.03em;font-weight:560;margin-top:2px;font-variant-numeric:tabular-nums}
+.stat .v.best{color:var(--text)}.stat .v.dim{color:var(--faint)}
+.stat .d{font-size:12.5px;color:var(--muted);margin-bottom:10px}
+/* column chart */
+.cols{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:10px;align-items:end;height:220px;margin:18px 0 0;
+border-bottom:1px solid var(--line);position:relative}
+.col{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;min-width:0}
+.col .val{font-size:13px;font-weight:600;margin-bottom:6px;font-variant-numeric:tabular-nums}
+.col .bar{width:100%;max-width:120px;border-radius:12px 12px 4px 4px;min-height:4px;
+background:repeating-linear-gradient(135deg,var(--accent) 0 5px,var(--accent-2) 5px 9px)}
+.col.top .bar{background:linear-gradient(180deg,#5b7ff2,var(--accent))}
+.col-labels{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:10px;margin-top:8px}
+.col-labels div{font-size:12.5px;color:var(--muted);text-align:center;line-height:1.3;overflow-wrap:anywhere}
+/* horizontal bars */
+.bars{margin:10px 0 2px}
+.bar-row{display:grid;grid-template-columns:minmax(0,8.5em) 1fr 3.4em;align-items:center;gap:10px;margin:8px 0;font-size:13.5px}
+.bar-row .name{display:flex;align-items:center;gap:7px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.track{height:10px;background:var(--chip);border-radius:99px;overflow:hidden;position:relative}
+.fill{height:100%;border-radius:99px}
+.fill.harm{background:repeating-linear-gradient(135deg,var(--bad) 0 4px,color-mix(in srgb,var(--bad) 55%,transparent) 4px 7px)}
+.num{text-align:right;font-variant-numeric:tabular-nums;font-weight:550}.num.bad{color:var(--bad)}
+.dot{width:9px;height:9px;border-radius:50%;flex:none;display:inline-block}
+.c0{background:var(--a0)}.c1{background:var(--a1)}.c2{background:var(--a2)}.c3{background:var(--a3)}.c4{background:var(--a4)}.c5{background:var(--a5)}
+/* skill grid */
+.skill{padding:14px 0;border-top:1px solid var(--line)}
+.skill:first-of-type{border-top:0}
+.skill .about{color:var(--muted);font-size:13px;margin:1px 0 6px}
+.diverge{display:grid;grid-template-columns:minmax(0,8.5em) 1fr 3.4em;gap:10px;align-items:center;margin:6px 0;font-size:13.5px}
+.diverge .track{background:none;height:10px;display:grid;grid-template-columns:1fr 1fr;overflow:visible}
+.diverge .neg-side{display:flex;justify-content:flex-end;border-right:1px solid var(--faint)}
+.diverge .neg-side span{background:var(--bad);border-radius:99px 0 0 99px;height:10px}
+.diverge .pos-side span{display:block;background:var(--accent);border-radius:0 99px 99px 0;height:10px}
+/* how to read */
+.explain{display:grid;gap:10px;margin:0}
+@media (min-width:760px){.explain{grid-template-columns:repeat(3,1fr)}}
+.explain div{background:var(--chip);border-radius:16px;padding:14px}
+.explain b{display:block;font-size:14px;margin-bottom:2px}
+.explain span{font-size:13px;color:var(--muted)}
+/* buttons and forms */
+.btn{display:inline-flex;justify-content:center;align-items:center;gap:8px;font:inherit;font-size:15px;font-weight:600;
+padding:13px 20px;border-radius:14px;border:0;background:var(--text);color:var(--card);text-decoration:none;cursor:pointer}
+.btn.block{display:flex;width:100%}
+.btn.light{background:var(--chip);color:var(--text)}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+input[type=password]{width:100%;font:inherit;font-size:16px;padding:13px 14px;border-radius:14px;
+border:1px solid var(--line);background:var(--card);color:var(--text)}
+.error{background:var(--bad-soft);color:var(--bad);border-radius:14px;padding:12px 14px;font-weight:550;margin:0 0 12px}
+details.tech{margin-top:12px}
+details.tech summary{cursor:pointer;color:var(--muted);font-size:13px}
+pre{background:var(--chip);padding:12px;border-radius:12px;overflow-x:auto;font-size:12.5px;white-space:pre-wrap;word-break:break-word}
+code{background:var(--chip);padding:1px 5px;border-radius:5px;font-size:.88em;overflow-wrap:anywhere}
+/* lists */
+.list a.item{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 0;border-top:1px solid var(--line);
+text-decoration:none}
+.list a.item:first-child{border-top:0}
+.list .title{font-weight:600}
+.list .meta{color:var(--muted);font-size:13px}
+.arrow{color:var(--faint);font-size:18px}
+.tag{display:inline-flex;align-items:center;font-size:12px;font-weight:550;padding:3px 9px;border-radius:99px;background:var(--chip);
+color:var(--muted);white-space:nowrap}
+.tag.emergent{background:var(--bad-soft);color:var(--bad)}.tag.high_acuity{background:#fff4e0;color:var(--warn)}
+@media (prefers-color-scheme:dark){.tag.high_acuity{background:#2d2410}}
+.tag.bad{background:var(--bad-soft);color:var(--bad)}.tag.good{background:var(--good-soft);color:var(--good)}
+.pills{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;margin:4px 0 8px;scrollbar-width:none}
+.pills a{flex:none;text-decoration:none;font-size:13.5px;padding:8px 13px;border-radius:99px;border:1px solid var(--line);
+background:var(--card);color:var(--muted);display:flex;align-items:center;gap:7px}
+.pills a.on{background:var(--text);color:var(--card);border-color:var(--text)}
+.convo-row{display:block;padding:16px 0;border-top:1px solid var(--line);text-decoration:none}
+.convo-row:first-child{border-top:0}
+.convo-row .first{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.convo-row .quote{color:var(--muted);font-size:13.5px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.verdicts{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.v{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;padding:4px 9px;border-radius:99px;background:var(--chip)}
+.v.bad{background:var(--bad-soft);color:var(--bad);font-weight:550}
+/* conversation */
+.chat{display:flex;flex-direction:column;gap:10px}
+.msg{max-width:88%;padding:11px 14px;border-radius:18px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14.5px}
+.msg.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:6px}
+.msg.assistant{align-self:flex-start;background:var(--chip);border-bottom-left-radius:6px}
+.msg.system{align-self:center;background:none;border:1px dashed var(--line);color:var(--muted);font-size:13px;max-width:100%}
+.who{font-size:11.5px;opacity:.75;display:block;margin-bottom:2px}
+.answer{border-top:1px solid var(--line);padding:4px 0}
+.answer:first-of-type{border-top:0}
+.answer summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:12px 0}
+.answer summary::-webkit-details-marker{display:none}
+.answer summary .grow{flex:1;font-weight:600}
+.answer .body{background:var(--chip);border-radius:16px;padding:14px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14.5px;margin-bottom:12px}
+.chev{transition:transform .2s;color:var(--faint)}
+details[open] .chev{transform:rotate(90deg)}
+.check{padding:14px 0;border-top:1px solid var(--line)}
+.check:first-of-type{border-top:0}
+.check .what{font-size:14.5px}
+.check .why{font-size:12.5px;color:var(--muted);margin-bottom:4px}
+.check .why.neg{color:var(--bad)}
+.section-label{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600;margin:22px 0 2px}
+.notice{font-size:12.5px;color:var(--muted);background:var(--chip);border-radius:14px;padding:10px 14px;margin:0 0 16px}
+.report h3,.report h4{margin-top:24px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:8px 0 14px}
+table{border-collapse:collapse;font-size:13px;min-width:100%}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 th{color:var(--muted);font-weight:600}
-blockquote{margin:8px 0;padding:10px 12px;border-left:3px solid var(--accent);background:var(--code);border-radius:6px}
-.run{display:block;padding:12px 0;border-bottom:1px solid var(--line);text-decoration:none;color:var(--text)}
-.run:last-child{border-bottom:0}
-.run .id{font-weight:600}.run .meta{color:var(--muted);font-size:13px}
-.pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:var(--code);color:var(--muted);margin-left:6px}
-.state{font-weight:600}.state.failed,.state.stopped{color:var(--bad)}.state.done{color:var(--good)}
-.error{color:var(--bad);font-weight:600}
-.notice{font-size:13px;color:var(--muted);border:1px dashed var(--line);border-radius:10px;padding:8px 12px}
-.mini{display:grid;grid-template-columns:12px minmax(0,1fr) 4em 6.5em;gap:8px;align-items:center;font-size:13px;margin-top:4px}
-.mini .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bad{color:var(--bad)}.muted{color:var(--muted)}
-.dot{display:inline-block;width:10px;height:10px;border-radius:50%;flex:none}
-.msg{margin:10px 0;padding:10px 12px;border-radius:12px;background:var(--code)}
-.msg.user{background:color-mix(in srgb,var(--accent) 14%,var(--card))}
-.msg .role{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-.text{white-space:pre-wrap;overflow-wrap:anywhere}
-.reply{border-bottom:1px solid var(--line);padding:10px 0}.reply:last-child{border-bottom:0}
-.reply summary{cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.reply .text{margin-top:10px;padding:10px 12px;background:var(--code);border-radius:10px}
-.crit{padding:12px 0;border-bottom:1px solid var(--line)}.crit:last-child{border-bottom:0}
-.crit .meta{font-size:12px;color:var(--muted);margin-bottom:4px}.crit.neg .meta{color:var(--bad)}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 8px;border-radius:99px;background:var(--code)}
-.chip.ok{background:color-mix(in srgb,var(--good) 18%,var(--card))}
-.chip.fail{background:color-mix(in srgb,var(--bad) 20%,var(--card));font-weight:600}
-.card h3{font-size:15px;margin:18px 0 2px}.card h3:first-of-type{margin-top:4px}
-.bars{margin:8px 0 4px}
-.bar{display:grid;grid-template-columns:minmax(0,9.5em) 1fr 3.6em;align-items:center;gap:8px;margin:7px 0;font-size:14px}
-.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bar-track{height:14px;background:var(--code);border-radius:7px;overflow:hidden}
-.bar-fill{height:100%;border-radius:7px}
-.bar-value{text-align:right;font-variant-numeric:tabular-nums}.bar-value.neg{color:var(--bad)}
-.c0{background:#4c6ef5}.c1{background:#e8590c}.c2{background:#2b8a3e}.c3{background:#ae3ec9}.c4{background:#1098ad}.c5{background:#c2255c}
-@media (prefers-color-scheme:dark){.c0{background:#7b97f0}.c1{background:#ff922b}.c2{background:#51cf66}.c3{background:#da77f2}.c4{background:#3bc9db}.c5{background:#f06595}}
-.report h2{font-size:18px;margin-top:28px}.report h3{font-size:16px}
+blockquote{margin:8px 0;padding:10px 12px;border-left:3px solid var(--accent);background:var(--chip);border-radius:8px;font-size:13.5px}
+.login{max-width:400px;margin:10vh auto 0}
+.empty{color:var(--muted);padding:12px 0}
 """
 
+FONT = ('<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">')
 
-def page(title: str, body: str, auth: bool = True) -> str:
-    logout = ('<form method="post" action="/logout"><button class="linkbtn">Log out</button></form>' if auth else "")
+
+def page(title: str, body: str, active: str = "", auth: bool = True) -> str:
+    nav = ""
+    if auth:
+        nav = (f'<nav class="nav"><a href="/"{" class=on" if active == "results" else ""}>Results</a>'
+               '<form method="post" action="/logout" style="margin:0"><button>Log out</button></form></nav>')
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body><main>"
-            f'<header><h1><a href="/" style="color:inherit;text-decoration:none">MentalHealthBench</a></h1>{logout}</header>'
-            f"{body}</main></body></html>")
+            f'<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
+            f"<title>{esc(title)} · Companion Check</title>{FONT}<style>{STYLE}</style></head><body>"
+            f'<div class="shell"><div class="frame"><header class="top"><a class="brand" href="/">'
+            f'<span class="logo">✓</span>Companion Check</a>{nav}</header>{body}</div></div></body></html>')
 
 
 def login_page(error: str = "") -> str:
-    err = f'<p class="error">{html.escape(error)}</p>' if error else ""
-    return page("Log in", f"""<div class="card"><h2>Log in</h2>{err}
-<form method="post" action="/login"><label for="pw">Password</label>
-<input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
-<button>Log in</button></form></div>""", auth=False)
+    err = f'<p class="error">{esc(error)}</p>' if error else ""
+    return page("Log in", f"""<div class="login"><h1>Welcome</h1>
+<p class="lead">This site tests how AI companion apps answer people in mental-health situations. Enter the team password.</p>
+<div class="card">{err}<form method="post" action="/login">
+<input name="password" type="password" placeholder="Password" autocomplete="current-password" autofocus required aria-label="Password">
+<button class="btn block" style="margin-top:12px">Log in</button></form></div></div>""", auth=False)
 
 
-def home_page(error: str = "") -> str:
-    cfg = config()
-    apps = "".join(f'<label><input type="checkbox" name="apps" value="{html.escape(a["name"])}" checked>'
-                   f'<span>{html.escape(a["name"])}<br><span class="hint">{html.escape(a.get("model", a["provider"]))}</span></span></label>'
-                   for a in cfg["apps"])
-    mode = cfg["judge"].get("mode", "decisions")
-    opts = "".join(f'<option value="{m}"{" selected" if m == mode else ""}>{label}</option>'
-                   for m, label in (("decisions", "Decisions API (fast, cheap)"),
-                                    ("responses", "Paper's grader prompt (exact replication, slower)")))
-    err = f'<p class="error">{html.escape(error)}</p>' if error else ""
-    runs = "".join(run_row(rid, data) for rid, data in list_runs()) or '<p class="hint">No runs yet.</p>'
-    return page("MentalHealthBench", f"""
-<div class="card" id="status"><h2>Current run</h2><div id="status-body">Loading…</div></div>
-<div class="card"><h2>Start a run</h2>{err}
-<form method="post" action="/run">
-<label for="limit">Tasks <span class="hint">1 to {MAX_TASKS}. Each task is sent to every app you pick. Start small.</span></label>
-<input id="limit" name="limit" type="number" inputmode="numeric" min="1" max="{MAX_TASKS}" value="10" required>
-<label>Apps</label><div class="checks">{apps}</div>
-<label for="mode">Judge</label><select id="mode" name="mode">{opts}</select>
-<div class="checks" style="margin-top:12px"><label><input type="checkbox" name="mock" value="1">
-Mock run <span class="hint">fake replies and grades, no cost</span></label></div>
-<button>Start run</button></form>
-<p class="hint">Finished work is cached. A repeated run costs nothing for the replies and grades it already has.</p></div>
-<div class="card"><h2>Results</h2>{runs}</div>
-<script>
-async function poll(){{
-  let s; try {{ s = await (await fetch('/api/status')).json(); }} catch(e) {{ return setTimeout(poll, 5000); }}
-  const b = document.getElementById('status-body');
-  const esc = t => t.replace(/[&<>]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;'}})[c]);
-  if (s.state === 'idle') {{ b.innerHTML = '<p class="hint">No run since the server started.</p>'; return; }}
-  let h = `<p><span class="state ${{s.state}}">${{s.state}}</span> · ${{Math.floor(s.elapsed/60)}}m ${{s.elapsed%60}}s<br><span class="hint">${{esc(s.args)}}</span></p><pre>${{esc(s.tail)}}</pre>`;
-  if (s.state === 'running') h += '<form method="post" action="/stop"><button class="secondary">Stop run</button></form>';
-  if (s.run_id) h += `<a class="btn" href="/runs/${{s.run_id}}">Open report</a>`;
-  b.innerHTML = h;
-  if (s.state === 'running') setTimeout(poll, 3000);
-  else if (!sessionStorage.getItem('seen-' + s.run_id)) {{ try {{ sessionStorage.setItem('seen-' + s.run_id, 1); }} catch(e) {{}} if (s.run_id) location.reload(); }}
-}}
-poll();
-</script>""")
+# --- Shared pieces ---
+
+def app_colors(apps) -> dict:
+    return {a: i % 6 for i, a in enumerate(apps)}
 
 
-def run_row(rid: str, data: dict) -> str:
-    meta = data.get("meta", {})
-    best = ", ".join(f"{html.escape(a)} {pct(s.get('clipped'))}" for a, s in data.get("summary", {}).items())
-    judge = meta.get("judge", {})
-    tag = '<span class="pill">mock</span>' if meta.get("mock") else ""
-    return (f'<a class="run" href="/runs/{rid}"><div class="id">{rid}{tag}</div>'
-            f'<div class="meta">{meta.get("n_tasks", "?")} tasks · judge {html.escape(str(judge.get("mode", "")))}</div>'
-            f'<div class="meta">{best}</div></a>')
+def score_columns(summary: dict, labels: dict, color: dict) -> str:
+    vals = {a: s.get("clipped") for a, s in summary.items()}
+    best = max((v for v in vals.values() if v == v and v is not None), default=None)
+    top = max(1e-9, best or 0)
+    cols = "".join(
+        f'<div class="col{" top" if v == best else ""}"><div class="val">{pct(v)}</div>'
+        f'<div class="bar" style="height:{max(2, 100 * (v or 0) / top * 0.82):.0f}%"></div></div>'
+        for a, v in vals.items())
+    names = "".join(f'<div><span class="dot c{color[a]}"></span> {esc(label_of(a, labels))}</div>' for a in vals)
+    return f'<div class="cols">{cols}</div><div class="col-labels">{names}</div>'
 
 
-def bars(rows: list, color: dict, scale: float) -> str:
-    """Horizontal bars, one per app, each labeled with its value."""
-    out = []
-    for app, v in rows:
-        width = 0 if v is None or v != v else max(0.0, min(1.0, v / scale)) * 100
-        neg = " neg" if v is not None and v == v and v < 0 else ""
-        out.append(f'<div class="bar"><div class="bar-label">{html.escape(app)}</div><div class="bar-track">'
-                   f'<div class="bar-fill c{color.get(app, 0)}" style="width:{width:.1f}%"></div></div>'
-                   f'<div class="bar-value{neg}">{pct(v)}</div></div>')
-    return '<div class="bars">' + "".join(out) + "</div>"
+def harm_bars(summary: dict, labels: dict, color: dict) -> str:
+    rows = "".join(
+        f'<div class="bar-row"><div class="name"><span class="dot c{color[a]}"></span>{esc(label_of(a, labels))}</div>'
+        f'<div class="track"><div class="fill harm" style="width:{100 * (s.get("harm_rate") or 0):.0f}%"></div></div>'
+        f'<div class="num{" bad" if (s.get("harm_rate") or 0) > 0 else ""}">{pct(s.get("harm_rate"))}</div></div>'
+        for a, s in summary.items())
+    return f'<div class="bars">{rows}</div>'
+
+
+def stat_tiles(summary: dict, labels: dict, color: dict) -> str:
+    best = max((s.get("clipped") or 0 for s in summary.values()), default=0)
+    return '<div class="stats">' + "".join(
+        f'<div class="stat"><div class="k"><span class="dot c{color[a]}"></span>{esc(label_of(a, labels))}</div>'
+        f'<div class="v{" best" if (s.get("clipped") or 0) == best else " dim"}">{pct(s.get("clipped"))}</div>'
+        f'<div class="d">Harm in {pct(s.get("harm_rate"))} of chats</div></div>'
+        for a, s in summary.items()) + "</div>"
+
+
+EXPLAIN = """<div class="explain">
+<div><b>Score</b><span>How much of the clinicians' checklist the app got right, from 0 to 100%. Higher is better.</span></div>
+<div><b>Harm rate</b><span>The share of conversations where the app did something the checklist calls harmful. Lower is better.</span></div>
+<div><b>Conversations</b><span>Real test chats from MentalHealthBench, written with clinicians. Each app answers the last message.</span></div>
+</div>"""
+
+
+# --- Pages ---
+
+def home_page() -> str:
+    runs = list_runs()
+    labels = app_labels()
+    feat = featured_run(runs)
+    hero = ""
+    if feat:
+        rid, data = feat
+        summary = data.get("summary", {})
+        color = app_colors(summary)
+        n = data["meta"].get("n_tasks", 0)
+        hero = f"""<div class="grid two">
+<div class="card" data-run="{rid}"><div class="card-head"><div><h2>Overall score</h2>
+<p class="sub">{n} conversations · {when(rid)}</p></div><a class="tag" href="/runs/{rid}">Details →</a></div>
+{score_columns(summary, labels, color)}
+<p class="sub" style="margin:14px 0 0">The share of the clinicians' checklist that each app got right. Higher is better.</p></div>
+<div class="card"><h2>Harm rate</h2><p class="sub">The share of conversations where the app did something harmful. Lower is better.</p>
+{harm_bars(summary, labels, color)}
+<div class="btn-row"><a class="btn" href="/runs/{rid}/tasks">Read the conversations</a>
+<a class="btn light" href="/runs/{rid}">Full results</a></div></div></div>"""
+    else:
+        hero = '<div class="card"><h2>No results yet</h2><p class="sub">Results show here after a test has run.</p></div>'
+    items = "".join(
+        f'<a class="item" href="/runs/{rid}" data-run="{rid}"><div><div class="title">{when(rid)}'
+        f'{" <span class=tag>practice</span>" if d["meta"].get("mock") else ""}</div>'
+        f'<div class="meta">{d["meta"].get("n_tasks", "?")} conversations · '
+        f'{", ".join(esc(label_of(a, labels)) for a in d.get("summary", {}))}</div></div><span class="arrow">›</span></a>'
+        for rid, d in runs) or '<p class="empty">No tests yet.</p>'
+    return page("Results", f"""<h1>Overview</h1>
+<p class="lead">We send real mental-health conversations to AI companion apps. Clinicians wrote a checklist for each one,
+and an AI judge checks every answer against it. Claude is a normal AI assistant, shown for comparison.</p>
+{hero}
+<div class="card"><h2>All tests</h2><p class="sub">Every test that has run, newest first.</p><div class="list">{items}</div></div>""",
+                active="results")
 
 
 def report_page(rid: str) -> str | None:
@@ -362,79 +478,123 @@ def report_page(rid: str) -> str | None:
     if not RUN_ID.match(rid) or not path.is_file():
         return None
     try:
-        summary = json.loads((RESULTS / rid / "summary.json").read_text()).get("summary", {})
+        data = json.loads((RESULTS / rid / "summary.json").read_text())
     except (OSError, json.JSONDecodeError):
-        summary = {}
-    axes = {}
-    if (RESULTS / rid / "scores_by_axis.csv").is_file():
-        with (RESULTS / rid / "scores_by_axis.csv").open() as f:
-            for row in csv.DictReader(f):
-                axes.setdefault(row["axis"], {})[row["app"]] = float(row["signed"])
-    color = {a: i % 6 for i, a in enumerate(summary)}
-    top = ""
-    if summary:
-        metrics = [("Score", "clipped", "Higher is better. The paper's headline number."),
-                   ("Harm rate", "harm_rate", "Lower is better. Share of replies where a penalty fired."),
-                   ("Penalty", "penalty", "Lower is better. Penalty points as a share of possible points.")]
-        groups = "".join(f'<h3>{title}</h3><p class="hint">{hint}</p>'
-                         + bars([(a, s.get(key)) for a, s in summary.items()], color, 1.0)
-                         for title, key, hint in metrics)
-        top += f'<div class="card"><h2>Overview</h2>{groups}</div>'
-    if axes:
-        scale = max((v for by_app in axes.values() for v in by_app.values()), default=0) or 1
-        groups = "".join(f'<h3>{html.escape(axis.replace("_", " "))}</h3>'
-                         + bars([(a, by_app.get(a)) for a in summary or by_app], color, scale)
-                         for axis, by_app in sorted(axes.items()))
-        top += ('<div class="card"><h2>By behavior axis</h2><p class="hint">Signed axis score: points earned minus '
-                'penalties, as a share of the task\'s possible points. The axes add up to the signed score, so the '
-                'bars are scaled to the largest axis value. Below zero means penalties outweighed points.</p>'
-                f'{groups}</div>')
+        data = {}
+    summary, meta = data.get("summary", {}), data.get("meta", {})
+    labels = app_labels()
+    color = app_colors(summary)
+    rows = run_rows(rid)
+    mock = ('<p class="error">This is a practice run. The answers and grades are fake, so the numbers mean nothing.</p>'
+            if meta.get("mock") else "")
+
+    # Skills: signed axis scores, drawn from a center line so that negative values go left.
+    axes = run_axes(rid)
+    scale = max((abs(v) for by_app in axes.values() for v in by_app.values()), default=0) or 1
+    skills = []
+    for axis in sorted(axes, key=axis_order):
+        short, about = axis_info(axis)
+        lines = []
+        for a in summary:
+            v = axes[axis].get(a)
+            if v is None:
+                continue
+            w = 100 * min(1, abs(v) / scale)
+            neg = f'<span style="width:{w:.0f}%"></span>' if v < 0 else ""
+            pos = f'<span style="width:{w:.0f}%"></span>' if v > 0 else ""
+            lines.append(f'<div class="diverge"><div class="name bar-row" style="margin:0;display:flex">'
+                         f'<span class="dot c{color[a]}"></span>&nbsp;{esc(label_of(a, labels))}</div>'
+                         f'<div class="track"><div class="neg-side">{neg}</div><div class="pos-side">{pos}</div></div>'
+                         f'<div class="num{" bad" if v < 0 else ""}">{pct(v)}</div></div>')
+        skills.append(f'<div class="skill"><b>{esc(short)}</b><div class="about">{esc(about)}</div>{"".join(lines)}</div>')
+
+    # By risk level.
+    risk = []
+    for key, (name, about) in ACUITY.items():
+        group = [r for r in rows if r["acuity"] == key]
+        if not group:
+            continue
+        per = "".join(
+            f'<div class="bar-row"><div class="name"><span class="dot c{color[a]}"></span>{esc(label_of(a, labels))}</div>'
+            f'<div class="track"><div class="fill c{color[a]}" style="width:{100 * avg:.0f}%"></div></div>'
+            f'<div class="num">{pct(avg)}</div></div>'
+            for a in summary
+            if (vals := [float(r["clipped"]) for r in group if r["app"] == a]) and (avg := sum(vals) / len(vals)) is not None)
+        n = len({r["task_id"] for r in group})
+        risk.append(f'<div class="skill"><b>{name}</b> <span class="muted small">· {n} conversations</span>'
+                    f'<div class="about">{about}</div><div class="bars">{per}</div></div>')
+
     files = " · ".join(f'<a href="/runs/{rid}/{f}">{f}</a>' for f in sorted(DOWNLOADS) if (RESULTS / rid / f).is_file())
-    browse = (f'<a class="btn" href="/runs/{rid}/tasks">Browse tasks: prompts, replies, and rubric</a>'
-              if run_rows(rid) else "")
-    return page(f"Run {rid}", f'<p><a href="/">← All runs</a></p>{browse}{top}<div class="card report">{markdown(path.read_text())}'
-                              f'<p class="hint">Download: {files}</p></div>')
+    browse = f'<a class="btn" href="/runs/{rid}/tasks">Read the conversations</a>' if rows else ""
+    body = f"""<a class="back" href="/">‹ All results</a>
+<h1>Results</h1><p class="lead">{meta.get("n_tasks", "?")} conversations · {when(rid)} ·
+{"fast grading" if meta.get("judge", {}).get("mode") == "decisions" else "paper's grader"}</p>
+{mock}<div class="card"><h2>How to read this</h2><p class="sub">Three words explain most of this page.</p>{EXPLAIN}
+<div class="btn-row">{browse}</div></div>
+<div class="grid two">
+<div class="card"><h2>Overall score</h2><p class="sub">Higher is better.</p>{score_columns(summary, labels, color)}{stat_tiles(summary, labels, color)}</div>
+<div class="card"><h2>Harm rate</h2><p class="sub">The share of conversations where the app did something harmful. Lower is better.</p>
+{harm_bars(summary, labels, color)}</div></div>
+<div class="card"><h2>By skill</h2><p class="sub">Points earned minus harm, for each kind of skill. Bars to the right are good.
+Red bars to the left mean that harm outweighed the good parts.</p>{"".join(skills) or '<p class="empty">No data.</p>'}</div>
+<div class="card"><h2>By risk level</h2><p class="sub">The score for each app, split by how serious the situation is.</p>
+{"".join(risk) or '<p class="empty">No data.</p>'}</div>
+<div class="card report"><details class="tech"><summary>Full technical report</summary>{markdown(path.read_text())}
+<p class="small muted">Download: {files}</p></details></div>"""
+    return page(f"Results {when(rid)}", body, active="results")
 
 
-NOTICE = ('<p class="notice">This page shows MentalHealthBench test content. The dataset authors ask that it is not '
-          'posted online. Do not share screenshots or copy it outside the team.</p>')
+NOTICE = ('<p class="notice">These conversations come from the MentalHealthBench test set. The authors ask that they are not '
+          'posted online. Keep them inside the team, and do not share screenshots.</p>')
 
 
 def task_list_page(rid: str, only: str) -> str | None:
     rows = run_rows(rid)
     if not RUN_ID.match(rid) or not rows:
         return None
+    labels = app_labels()
     apps = list(dict.fromkeys(r["app"] for r in rows))
-    color = {a: i % 6 for i, a in enumerate(apps)}
+    color = app_colors(apps)
+    tasks = dataset_tasks()
     by_task = {}
     for r in rows:
         by_task.setdefault(r["task_id"], {"meta": r, "apps": {}})["apps"][r["app"]] = r
-    items = sorted(by_task.items(), key=lambda kv: (-sum(int(x["penalties_fired"]) > 0 for x in kv[1]["apps"].values()),
-                                                     kv[1]["meta"]["acuity"], kv[0]))
-    if only in apps:
-        items = [kv for kv in items if int(kv[1]["apps"].get(only, {}).get("penalties_fired", 0)) > 0]
-    elif only == "harm":
-        items = [kv for kv in items if any(int(x["penalties_fired"]) > 0 for x in kv[1]["apps"].values())]
-    opts = [("", "All tasks"), ("harm", "A penalty fired for any app")] + [(a, f"A penalty fired for {a}") for a in apps]
-    select = "".join(f'<option value="{html.escape(v)}"{" selected" if v == only else ""}>{html.escape(t)}</option>'
-                     for v, t in opts)
+    harmed = lambda d, a=None: [x for k, x in d["apps"].items() if (a is None or k == a) and int(x["penalties_fired"]) > 0]
+    order = {"emergent": 0, "high_acuity": 1, "non_acute": 2}
+    items = sorted(by_task.items(), key=lambda kv: (-len(harmed(kv[1])), order.get(kv[1]["meta"]["acuity"], 3), kv[0]))
+    if only == "harm":
+        items = [kv for kv in items if harmed(kv[1])]
+    elif only in apps:
+        items = [kv for kv in items if harmed(kv[1], only)]
+    elif only in ACUITY:
+        items = [kv for kv in items if kv[1]["meta"]["acuity"] == only]
+    pills = [("", "All"), ("harm", "Any harm")] + [(k, v[0]) for k, v in ACUITY.items()] + \
+            [(a, f"Harm by {label_of(a, labels)}") for a in apps]
+    pill_html = "".join(f'<a href="?only={quote(k)}"{" class=on" if k == only else ""}>'
+                        f'{"<span class=" + chr(34) + "dot c" + str(color[k]) + chr(34) + "></span>" if k in apps else ""}'
+                        f'{esc(t)}</a>' for k, t in pills)
     cards = []
     for tid, d in items:
         m = d["meta"]
-        lines = "".join(
-            f'<div class="mini"><span class="dot c{color[a]}"></span><span class="name">{html.escape(a)}</span>'
-            f'<span>{pct(float(x["clipped"]))}</span>'
-            f'<span class="{"bad" if int(x["penalties_fired"]) else "muted"}">'
-            f'{x["penalties_fired"]} penalt{"y" if x["penalties_fired"] == "1" else "ies"}</span></div>'
+        task = tasks.get(tid)
+        last = next((x["content"] for x in reversed(task.messages) if x["role"] == "user"), "") if task else ""
+        name, _ = ACUITY.get(m["acuity"], (m["acuity"], ""))
+        verdicts = "".join(
+            f'<span class="v{" bad" if int(x["penalties_fired"]) else ""}"><span class="dot c{color[a]}"></span>'
+            f'{esc(label_of(a, labels))} · {pct(float(x["clipped"]))}'
+            f'{" · harm" if int(x["penalties_fired"]) else ""}</span>'
             for a, x in d["apps"].items())
-        cards.append(f'<a class="run" href="/runs/{rid}/tasks/{tid}"><div class="id">{html.escape(tid[:12])}…</div>'
-                     f'<div class="meta">{html.escape(m["acuity"])} · {html.escape(m["user_profile"])} · '
-                     f'{m["user_turns"]} user turn{"s" if m["user_turns"] != "1" else ""}</div>{lines}</a>')
-    body = (f'<p><a href="/runs/{rid}">← Report</a></p>{NOTICE}<div class="card"><h2>Tasks in run {rid}</h2>'
-            f'<form method="get"><select name="only" onchange="this.form.submit()">{select}</select></form>'
-            f'<p class="hint">{len(items)} tasks. Tasks with the most penalties come first. '
-            f'Score is the clipped score for that task.</p>{"".join(cards) or "<p>No tasks match.</p>"}</div>')
-    return page(f"Tasks · {rid}", body)
+        cards.append(f'<a class="convo-row" href="/runs/{rid}/tasks/{tid}"><div class="first">'
+                     f'<span class="tag {esc(m["acuity"])}">{esc(name)}</span><span class="tag">{esc(m["user_profile"].capitalize())}</span>'
+                     f'<span class="small muted">{m["user_turns"]} message{"s" if m["user_turns"] != "1" else ""} from the person</span></div>'
+                     f'<div class="quote">“{esc(last[:220])}”</div><div class="verdicts">{verdicts}</div></a>')
+    body = (f'<a class="back" href="/runs/{rid}">‹ Results</a><h1>Conversations</h1>'
+            f'<p class="lead">Open a conversation to read what each app said and which checklist items it passed or failed. '
+            f'Conversations with the most harm come first.</p>{NOTICE}'
+            f'<div class="pills">{pill_html}</div>'
+            f'<div class="card"><p class="sub" style="margin-top:0">{len(items)} conversations</p>'
+            f'{"".join(cards) or "<p class=empty>No conversations match this filter.</p>"}</div>')
+    return page("Conversations", body, active="results")
 
 
 def task_page(rid: str, tid: str) -> str | None:
@@ -442,51 +602,66 @@ def task_page(rid: str, tid: str) -> str | None:
     task = dataset_tasks().get(tid)
     if not RUN_ID.match(rid) or not rows or task is None:
         return None
+    labels = app_labels()
     replies, verdicts = run_raw(rid, tid)
     apps = list(dict.fromkeys(r["app"] for r in run_rows(rid)))
-    color = {a: i % 6 for i, a in enumerate(apps)}
-    m = rows[0]
-    convo = "".join(f'<div class="msg {x["role"]}"><div class="role">{x["role"]}</div>'
-                    f'<div class="text">{html.escape(x["content"])}</div></div>' for x in task.messages)
+    color = app_colors(apps)
     score = {r["app"]: r for r in rows}
-    reply_blocks = []
+    m = rows[0]
+    who = {"user": "Person", "assistant": "Earlier reply", "system": "Background"}
+    chat = "".join(f'<div class="msg {x["role"]}"><span class="who">{who.get(x["role"], x["role"])}</span>{esc(x["content"])}</div>'
+                   for x in task.messages)
+    answers = []
     for a in apps:
         if a not in score:
             continue
         r = replies.get(a, {})
-        text = r.get("text") or r.get("error") or "(The raw reply is not in this run folder.)"
+        text = r.get("text") or r.get("error") or "This answer is not saved in this test."
         sc = score[a]
-        reply_blocks.append(
-            f'<details class="reply"><summary><span class="dot c{color[a]}"></span><b>{html.escape(a)}</b> · '
-            f'score {pct(float(sc["clipped"]))} · {sc["penalties_fired"]} penalties</summary>'
-            f'<div class="text">{html.escape(text)}</div></details>')
-    crit = []
-    for c in sorted(task.criteria, key=lambda c: (c.points > 0, -abs(c.points))):
+        harm = int(sc["penalties_fired"])
+        tag = f'<span class="tag bad">{harm} harmful</span>' if harm else '<span class="tag good">No harm</span>'
+        answers.append(f'<details class="answer"><summary><span class="dot c{color[a]}"></span>'
+                       f'<span class="grow">{esc(label_of(a, labels))}</span>{tag}'
+                       f'<span class="tag">{pct(float(sc["clipped"]))}</span><span class="chev">›</span></summary>'
+                       f'<div class="body">{esc(text)}</div></details>')
+
+    def check(c):
         chips = []
         for a in apps:
-            v = verdicts.get((a, c.id))
             if a not in score:
                 continue
+            v = verdicts.get((a, c.id))
             if v is None or "met" not in v:
-                chips.append(f'<span class="chip">{html.escape(a)}: ?</span>')
+                chips.append(f'<span class="v"><span class="dot c{color[a]}"></span>{esc(label_of(a, labels))} · ?</span>')
                 continue
             good = v["met"] == (c.points > 0)
-            mark = "met" if v["met"] else "not met"
-            prob = f' ({v["probability"]:.2f})' if isinstance(v.get("probability"), (int, float)) else ""
-            chips.append(f'<span class="chip {"ok" if good else "fail"}"><span class="dot c{color[a]}"></span>'
-                         f'{html.escape(a)}: {mark}{prob}</span>')
-        kind = "Penalty" if c.points < 0 else "Points"
-        crit.append(f'<div class="crit {"neg" if c.points < 0 else "pos"}"><div class="meta">{kind} {c.points:+g} · '
-                    f'{html.escape(c.axis.replace("_", " "))} · {html.escape(c.id)}</div>'
-                    f'<div>{html.escape(c.text)}</div><div class="chips">{"".join(chips)}</div></div>')
-    body = (f'<p><a href="/runs/{rid}/tasks">← All tasks</a></p>{NOTICE}'
-            f'<div class="card"><h2>Task {html.escape(tid[:12])}…</h2><p class="hint">{html.escape(m["acuity"])} · '
-            f'{html.escape(m["user_profile"])} · {html.escape(m["language"])} · full id {html.escape(tid)}</p>{convo}</div>'
-            f'<div class="card"><h2>Replies</h2><p class="hint">Tap an app to read its reply.</p>{"".join(reply_blocks)}</div>'
-            f'<div class="card"><h2>Rubric</h2><p class="hint">Penalties come first. Green means the app did the right '
-            f'thing: it met a points criterion, or it avoided a penalty. Red means it missed points or a penalty fired. '
-            f'The number is the judge\'s probability.</p>{"".join(crit)}</div>')
-    return page(f"Task {tid[:12]}", body)
+            if c.points > 0:
+                word = "did it" if v["met"] else "missed it"
+            else:
+                word = "did this" if v["met"] else "avoided it"
+            chips.append(f'<span class="v{"" if good else " bad"}"><span class="dot c{color[a]}"></span>'
+                         f'{esc(label_of(a, labels))} · {word}</span>')
+        short, _ = axis_info(c.axis)
+        why = f'{"Harmful" if c.points < 0 else "Worth"} {abs(c.points):g} points · {esc(short)}'
+        return (f'<div class="check"><div class="why{" neg" if c.points < 0 else ""}">{why}</div>'
+                f'<div class="what">{esc(c.text)}</div><div class="verdicts">{"".join(chips)}</div></div>')
+
+    harms = [check(c) for c in sorted(task.criteria, key=lambda c: c.points) if c.points < 0]
+    goods = [check(c) for c in sorted(task.criteria, key=lambda c: -c.points) if c.points > 0]
+    name, about = ACUITY.get(m["acuity"], (m["acuity"], ""))
+    body = (f'<a class="back" href="/runs/{rid}/tasks">‹ All conversations</a><h1>Conversation</h1>'
+            f'<p class="lead"><span class="tag {esc(m["acuity"])}">{esc(name)}</span> '
+            f'<span class="tag">{esc(m["user_profile"].capitalize())}</span> <span class="small muted">{esc(about)}</span></p>{NOTICE}'
+            f'<div class="card"><h2>The conversation</h2><p class="sub">Each app reads this and writes the next reply.</p>'
+            f'<div class="chat">{chat}</div></div>'
+            f'<div class="card"><h2>What each app said</h2><p class="sub">Tap an app to read its reply. '
+            f'The percentage is its score on this conversation.</p>{"".join(answers)}</div>'
+            f'<div class="card"><h2>The checklist</h2><p class="sub">Clinicians wrote these items for this conversation. '
+            f'Red means the app did something harmful or missed something it should do.</p>'
+            f'{"<div class=section-label>Should not do</div>" + "".join(harms) if harms else ""}'
+            f'{"<div class=section-label>Should do</div>" + "".join(goods) if goods else ""}'
+            f'<p class="small muted" style="margin-top:16px">Conversation id: {esc(tid)}</p></div>')
+    return page("Conversation", body, active="results")
 
 
 # --- HTTP ---
@@ -521,12 +696,16 @@ class Handler(BaseHTTPRequestHandler):
     def redirect(self, to: str, headers: dict = None):
         self.send(303, "", headers={"Location": to, **(headers or {})})
 
+    def not_found(self, text: str = "This page does not exist."):
+        self.send(404, page("Not found", f'<h1>Not found</h1><p class="lead">{esc(text)}</p><a class="btn" href="/">Go to results</a>'))
+
     def form(self) -> dict:
         n = min(int(self.headers.get("Content-Length") or 0), 10_000)
         return parse_qs(self.rfile.read(n).decode(errors="replace"))
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        url = urlparse(self.path)
+        path = url.path
         if path == "/healthz":
             return self.send(200, "ok", "text/plain")
         if path == "/login":
@@ -535,26 +714,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect("/login")
         if path == "/":
             return self.send(200, home_page())
-        if path == "/api/status":
-            return self.send(200, json.dumps(JOB.status()), "application/json")
         parts = path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "runs":
             body = report_page(parts[1])
-            return self.send(200, body) if body else self.send(404, page("Not found", "<p>No such run.</p>"))
+            return self.send(200, body) if body else self.not_found("There is no test with this name.")
         if len(parts) == 3 and parts[0] == "runs" and parts[2] == "tasks":
-            only = (parse_qs(urlparse(self.path).query).get("only") or [""])[0]
+            only = (parse_qs(url.query).get("only") or [""])[0]
             body = task_list_page(parts[1], only)
-            return self.send(200, body) if body else self.send(404, page("Not found", "<p>No task data for this run.</p>"))
+            return self.send(200, body) if body else self.not_found("This test has no conversations to show.")
         if len(parts) == 4 and parts[0] == "runs" and parts[2] == "tasks":
             body = task_page(parts[1], parts[3])
-            return self.send(200, body) if body else self.send(404, page("Not found", "<p>No such task in this run.</p>"))
+            return self.send(200, body) if body else self.not_found("This conversation is not in this test.")
         if len(parts) == 3 and parts[0] == "runs" and RUN_ID.match(parts[1]) and parts[2] in DOWNLOADS:
             f = RESULTS / parts[1] / parts[2]
             if f.is_file():
                 ctype = {"md": "text/markdown", "json": "application/json", "csv": "text/csv"}[f.suffix[1:]]
                 return self.send(200, f.read_bytes(), ctype + "; charset=utf-8",
                                  {"Content-Disposition": f'attachment; filename="{parts[1]}-{parts[2]}"'})
-        self.send(404, page("Not found", "<p>Not found.</p>"))
+        self.not_found()
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -565,33 +742,12 @@ class Handler(BaseHTTPRequestHandler):
                 cookie = f"{COOKIE}={make_token()}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DAYS * 86400}{secure}"
                 return self.redirect("/", {"Set-Cookie": cookie})
             time.sleep(1)  # slows down password guessing
-            return self.send(401, login_page("Wrong password."))
+            return self.send(401, login_page("That password is not correct."))
         if path == "/logout":
             return self.redirect("/login", {"Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0"})
         if not self.authed():
             return self.redirect("/login")
-        if path == "/stop":
-            JOB.stop()
-            return self.redirect("/")
-        if path == "/run":
-            f = self.form()
-            known = {a["name"] for a in config()["apps"]}
-            apps = [a for a in f.get("apps", []) if a in known]
-            try:
-                limit = int((f.get("limit") or ["0"])[0])
-            except ValueError:
-                limit = 0
-            mode = (f.get("mode") or ["decisions"])[0]
-            if not apps:
-                return self.send(400, home_page("Pick at least one app."))
-            if not 1 <= limit <= MAX_TASKS or mode not in ("decisions", "responses"):
-                return self.send(400, home_page(f"Tasks must be from 1 to {MAX_TASKS}."))
-            args = ["--limit", str(limit), "--apps", ",".join(apps), "--judge-mode", mode]
-            if f.get("mock"):
-                args.append("--mock")
-            error = JOB.start(args)
-            return self.send(409, home_page(error)) if error else self.redirect("/")
-        self.send(404, page("Not found", "<p>Not found.</p>"))
+        self.not_found()
 
 
 def main():

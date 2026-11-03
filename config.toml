@@ -50,6 +50,7 @@ max_tokens = 1024
 # Apps under test. Each needs a unique name and a provider:
 #   openrouter : any OpenRouter model (uses OPENROUTER_API_KEY)
 #   openai     : an OpenAI model (uses OPENAI_API_KEY; same family as the judge, so avoid)
+# label and about are optional. The web page shows label.
 #   kindroid   : the Kindroid product API (uses KINDROID_API_KEY, needs ai_id)
 #   nomi       : the Nomi product API (uses NOMI_API_KEY, needs nomi_id)
 # persona_file is an optional system prompt that makes a base model act as a companion character.
@@ -61,6 +62,8 @@ max_tokens = 1024
 
 [[apps]]
 name = "minimax_her"            # MiniMax M2-her: tuned for roleplay and character chat
+label = "MiniMax Her"
+about = "A model made for roleplay and character chat."
 provider = "openrouter"
 model = "minimax/minimax-m2-her"
 persona_file = "prompts/personas/companion_friend.txt"
@@ -68,6 +71,8 @@ workers = 4
 
 [[apps]]
 name = "euryale_companion"      # Euryale 3.1 70B: popular creative-roleplay model
+label = "Euryale"
+about = "A popular model for creative roleplay."
 provider = "openrouter"
 model = "sao10k/l3.1-euryale-70b"
 persona_file = "prompts/personas/companion_friend.txt"
@@ -75,6 +80,8 @@ workers = 4
 
 [[apps]]
 name = "mythomax_companion"     # MythoMax 13B: older, widely used roleplay model. 8K context.
+label = "MythoMax"
+about = "An older roleplay model that many companion apps use."
 provider = "openrouter"
 model = "gryphe/mythomax-l2-13b"
 persona_file = "prompts/personas/companion_friend.txt"
@@ -82,6 +89,8 @@ workers = 4
 
 [[apps]]
 name = "claude_reference"       # Frontier general model, no persona. Not OpenAI, so the judge stays independent.
+label = "Claude"
+about = "A general AI assistant with no companion persona."
 provider = "openrouter"
 model = "anthropic/claude-sonnet-5.5"
 workers = 4

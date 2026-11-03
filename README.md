@@ -104,7 +104,7 @@ mhb/                  the code
 
 ## Web demo
 
-A small web page lets teammates start runs and read reports on a phone. It has one shared password.
+A small web page lets teammates explore the results on a phone or a computer. It has one shared password. It is read-only: nobody can start a run from it, so it cannot cost money.
 
 Run it on your computer:
 
@@ -112,15 +112,18 @@ Run it on your computer:
 python3 -m mhb.web
 ```
 
-Then open http://localhost:8080. It reads `DEMO_PASSWORD` and the API keys from `.env`.
+Then open http://localhost:8080. It reads `DEMO_PASSWORD` from `.env`.
 
-The page:
+The page shows:
 
-- starts a run (number of tasks, apps, judge mode, or a free mock run), shows its progress, and can stop it;
-- lists the runs and shows each report, with a short summary for each app;
-- lets you download `report.md`, `summary.json`, and the CSV files.
+- **Results:** the overall score and the harm rate of each app, with short explanations.
+- **By skill and by risk level:** where each app does well or badly.
+- **Conversations:** each test conversation, what each app replied, and which checklist items it passed or failed. These pages show dataset text, so keep the password inside the team.
+- The full technical report and the CSV and JSON files, for download.
 
-It never serves `raw/` or `.env`. Only one run can go at a time. `MAX_TASKS` (default 150) is the largest run a teammate can start. Each run costs API money, so give the password only to people you trust.
+It never serves `.env`.
+
+To add results, run the benchmark on the server (see below). The page shows each new run automatically.
 
 ### Deploy to Fly.io
 
@@ -132,11 +135,19 @@ The dataset is not in git, so deploy from a folder that has the dataset in `data
    fly apps create <name>
    fly volumes create mhb_results --app <name> --region iad --size 1
    ```
-3. Send the keys and the password from `.env` as secrets:
+3. Send the keys and the password from `.env` as secrets (the keys are needed only to run the benchmark on the server):
    ```bash
    grep -E '^(OPENROUTER_API_KEY|OPENAI_API_KEY|DEMO_PASSWORD)=' .env | fly secrets import --app <name>
    ```
 4. Deploy: `fly deploy`. The page is at `https://<name>.fly.dev`.
+
+To run the benchmark on the server, so that the results show on the page:
+
+```bash
+fly ssh console --app <name> -C "sh -c 'cd /app && setsid nohup python3 -m mhb --yes > /app/results/run.log 2>&1 < /dev/null &'"
+```
+
+Add flags after `--yes`, for example `--max-tasks 350` or `--judge-mode responses`. The cache on the volume makes a repeated run free for the work it already has.
 
 To change the password, run `fly secrets set DEMO_PASSWORD=<new password> --app <name>`. This also logs out everyone.
 
