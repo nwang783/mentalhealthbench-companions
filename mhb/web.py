@@ -3,6 +3,7 @@
 Start it with:  DEMO_PASSWORD=... python3 -m mhb.web
 One run at a time. Raw replies and verdicts are never served, because they hold dataset text.
 """
+import csv
 import hashlib
 import hmac
 import html
@@ -207,9 +208,15 @@ blockquote{margin:8px 0;padding:10px 12px;border-left:3px solid var(--accent);ba
 .pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:var(--code);color:var(--muted);margin-left:6px}
 .state{font-weight:600}.state.failed,.state.stopped{color:var(--bad)}.state.done{color:var(--good)}
 .error{color:var(--bad);font-weight:600}
-.app{padding:10px 0;border-bottom:1px solid var(--line)}.app .id{font-weight:600}
-.nums{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
-.nums b{display:block;font-size:18px}.nums span{color:var(--muted);font-size:12px}
+.card h3{font-size:15px;margin:18px 0 2px}.card h3:first-of-type{margin-top:4px}
+.bars{margin:8px 0 4px}
+.bar{display:grid;grid-template-columns:minmax(0,9.5em) 1fr 3.6em;align-items:center;gap:8px;margin:7px 0;font-size:14px}
+.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-track{height:14px;background:var(--code);border-radius:7px;overflow:hidden}
+.bar-fill{height:100%;border-radius:7px}
+.bar-value{text-align:right;font-variant-numeric:tabular-nums}.bar-value.neg{color:var(--bad)}
+.c0{background:#4c6ef5}.c1{background:#e8590c}.c2{background:#2b8a3e}.c3{background:#ae3ec9}.c4{background:#1098ad}.c5{background:#c2255c}
+@media (prefers-color-scheme:dark){.c0{background:#7b97f0}.c1{background:#ff922b}.c2{background:#51cf66}.c3{background:#da77f2}.c4{background:#3bc9db}.c5{background:#f06595}}
 .report h2{font-size:18px;margin-top:28px}.report h3{font-size:16px}
 """
 
@@ -282,6 +289,18 @@ def run_row(rid: str, data: dict) -> str:
             f'<div class="meta">{best}</div></a>')
 
 
+def bars(rows: list, color: dict, scale: float) -> str:
+    """Horizontal bars, one per app, each labeled with its value."""
+    out = []
+    for app, v in rows:
+        width = 0 if v is None or v != v else max(0.0, min(1.0, v / scale)) * 100
+        neg = " neg" if v is not None and v == v and v < 0 else ""
+        out.append(f'<div class="bar"><div class="bar-label">{html.escape(app)}</div><div class="bar-track">'
+                   f'<div class="bar-fill c{color.get(app, 0)}" style="width:{width:.1f}%"></div></div>'
+                   f'<div class="bar-value{neg}">{pct(v)}</div></div>')
+    return '<div class="bars">' + "".join(out) + "</div>"
+
+
 def report_page(rid: str) -> str | None:
     path = RESULTS / rid / "report.md"
     if not RUN_ID.match(rid) or not path.is_file():
@@ -290,14 +309,30 @@ def report_page(rid: str) -> str | None:
         summary = json.loads((RESULTS / rid / "summary.json").read_text()).get("summary", {})
     except (OSError, json.JSONDecodeError):
         summary = {}
-    cards = "".join(
-        f'<div class="app"><div class="id">{html.escape(a)}</div><div class="nums">'
-        f'<div><b>{pct(s.get("harm_rate"))}</b><span>harm rate</span></div>'
-        f'<div><b>{pct(s.get("penalty"))}</b><span>penalty</span></div>'
-        f'<div><b>{pct(s.get("clipped"))}</b><span>score</span></div></div></div>'
-        for a, s in summary.items())
-    top = (f'<div class="card"><h2>Summary</h2>{cards}<p class="hint">Lower harm rate and penalty are better. '
-           f'Higher score is better. The full report is below.</p></div>') if cards else ""
+    axes = {}
+    if (RESULTS / rid / "scores_by_axis.csv").is_file():
+        with (RESULTS / rid / "scores_by_axis.csv").open() as f:
+            for row in csv.DictReader(f):
+                axes.setdefault(row["axis"], {})[row["app"]] = float(row["signed"])
+    color = {a: i % 6 for i, a in enumerate(summary)}
+    top = ""
+    if summary:
+        metrics = [("Score", "clipped", "Higher is better. The paper's headline number."),
+                   ("Harm rate", "harm_rate", "Lower is better. Share of replies where a penalty fired."),
+                   ("Penalty", "penalty", "Lower is better. Penalty points as a share of possible points.")]
+        groups = "".join(f'<h3>{title}</h3><p class="hint">{hint}</p>'
+                         + bars([(a, s.get(key)) for a, s in summary.items()], color, 1.0)
+                         for title, key, hint in metrics)
+        top += f'<div class="card"><h2>Overview</h2>{groups}</div>'
+    if axes:
+        scale = max((v for by_app in axes.values() for v in by_app.values()), default=0) or 1
+        groups = "".join(f'<h3>{html.escape(axis.replace("_", " "))}</h3>'
+                         + bars([(a, by_app.get(a)) for a in summary or by_app], color, scale)
+                         for axis, by_app in sorted(axes.items()))
+        top += ('<div class="card"><h2>By behavior axis</h2><p class="hint">Signed axis score: points earned minus '
+                'penalties, as a share of the task\'s possible points. The axes add up to the signed score, so the '
+                'bars are scaled to the largest axis value. Below zero means penalties outweighed points.</p>'
+                f'{groups}</div>')
     files = " · ".join(f'<a href="/runs/{rid}/{f}">{f}</a>' for f in sorted(DOWNLOADS) if (RESULTS / rid / f).is_file())
     return page(f"Run {rid}", f'<p><a href="/">← All runs</a></p>{top}<div class="card report">{markdown(path.read_text())}'
                               f'<p class="hint">Download: {files}</p></div>')
