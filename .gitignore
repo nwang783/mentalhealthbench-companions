@@ -1,0 +1,7 @@
+.env
+results/
+data/mentalhealthbench/*
+!data/mentalhealthbench/README.md
+__pycache__/
+*.pyc
+.DS_Store
